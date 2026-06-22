@@ -1,0 +1,5 @@
+openai>=1.30.0
+networkx>=3.2
+python-dotenv>=1.0.0
+rich>=13.7.0
+PyPDF2>=3.0.0
