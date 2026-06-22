@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 .env
 results/graph.json
-results/graph.html
 results/graph_snapshots/
 .DS_Store
