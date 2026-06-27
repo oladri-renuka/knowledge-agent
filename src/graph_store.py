@@ -1,35 +1,35 @@
-"""Persistent knowledge graph with source attribution and cached semantic embeddings."""
+"""Persistent knowledge graph with ChromaDB-backed embedding storage."""
 
 import json
 import copy
 import logging
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import networkx as nx
+import chromadb
 
 log = logging.getLogger(__name__)
 
 SEMANTIC_THRESHOLD = 0.75
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
 class KnowledgeGraph:
-    def __init__(self, path: str = "results/graph.json"):
+    def __init__(self, path: str = "results/graph.json", chroma_path: str = "results/chroma_db"):
         self.path = Path(path)
         self.graph = nx.DiGraph()
         self._claims: list[dict] = []
         self._contradictions: list[dict] = []
-        self._entity_embeddings: dict[str, list[float]] = {}
-        self._claim_embeddings: list[list[float]] = []
+
+        self._chroma = chromadb.PersistentClient(path=chroma_path)
+        self._entity_col = self._chroma.get_or_create_collection(
+            name="entities", metadata={"hnsw:space": "cosine"}
+        )
+        self._claim_col = self._chroma.get_or_create_collection(
+            name="claims", metadata={"hnsw:space": "cosine"}
+        )
+
         if self.path.exists():
             self._load()
 
@@ -40,32 +40,21 @@ class KnowledgeGraph:
             return
         data = json.loads(raw)
         for node in data.get("nodes", []):
-            attrs = {k: v for k, v in node.items() if k not in ("name", "embedding")}
-            self.graph.add_node(node["name"], **attrs)
-            if "embedding" in node:
-                self._entity_embeddings[node["name"]] = node["embedding"]
+            self.graph.add_node(node["name"], **{k: v for k, v in node.items() if k != "name"})
         for edge in data.get("edges", []):
             self.graph.add_edge(edge["source"], edge["target"], relation=edge["relation"])
         self._claims = data.get("claims", [])
         self._contradictions = data.get("contradictions", [])
-        self._claim_embeddings = data.get("claim_embeddings", [])
-        log.info("Loaded graph: %d nodes, %d edges, %d claims, %d entity embeddings cached",
-                 self.graph.number_of_nodes(), self.graph.number_of_edges(),
-                 len(self._claims), len(self._entity_embeddings))
+        log.info("Loaded graph: %d nodes, %d edges, %d claims, chroma entities: %d, chroma claims: %d",
+                 self.graph.number_of_nodes(), self.graph.number_of_edges(), len(self._claims),
+                 self._entity_col.count(), self._claim_col.count())
 
     def _serialize(self) -> dict:
-        nodes = []
-        for n, d in self.graph.nodes(data=True):
-            node = {"name": n, **d}
-            if n in self._entity_embeddings:
-                node["embedding"] = self._entity_embeddings[n]
-            nodes.append(node)
         return {
-            "nodes": nodes,
+            "nodes": [{"name": n, **d} for n, d in self.graph.nodes(data=True)],
             "edges": [{"source": u, "target": v, **d} for u, v, d in self.graph.edges(data=True)],
             "claims": self._claims,
             "contradictions": self._contradictions,
-            "claim_embeddings": self._claim_embeddings,
         }
 
     def _atomic_write(self, path: Path, data: dict):
@@ -87,15 +76,11 @@ class KnowledgeGraph:
         data = self._serialize()
         data["snapshot_label"] = label
         data["snapshot_time"] = datetime.now(timezone.utc).isoformat()
-        data.pop("claim_embeddings", None)
-        for node in data["nodes"]:
-            node.pop("embedding", None)
         self._atomic_write(snap_path, data)
 
-    # --- Entity resolution: alias-only (fast), or batch semantic (see batch_resolve) ---
+    # --- Entity resolution ---
 
     def resolve_entity_by_alias(self, name: str, aliases: list[str] | None = None) -> str | None:
-        """Fast alias-only resolution. No API calls. Returns None if no match."""
         check_names = [name.lower()] + [a.lower() for a in (aliases or [])]
         for node, data in self.graph.nodes(data=True):
             node_aliases = data.get("aliases", [])
@@ -106,37 +91,25 @@ class KnowledgeGraph:
         return None
 
     def batch_resolve_entities(self, names: list[str], embeddings: list[list[float]]) -> dict[str, str]:
-        """Resolve a batch of entity names against cached entity embeddings.
-
-        Returns a mapping {input_name: canonical_name}.
-        Uses alias matching first, then semantic similarity against cached embeddings.
-        Zero API calls — all similarity is computed against pre-cached vectors.
-        """
+        """Resolve entity names against ChromaDB. Zero API calls — uses cached vectors."""
         resolution_map = {}
-        cached_entities = list(self._entity_embeddings.keys())
-        cached_vecs = [self._entity_embeddings[e] for e in cached_entities]
 
         for name, emb in zip(names, embeddings):
-            # Pass 1: alias match
             alias_match = self.resolve_entity_by_alias(name)
             if alias_match:
                 resolution_map[name] = alias_match
                 continue
 
-            # Pass 2: semantic similarity against cached entity embeddings
-            if cached_vecs:
-                best_score = 0.0
-                best_entity = None
-                for i, cv in enumerate(cached_vecs):
-                    score = _cosine_similarity(emb, cv)
-                    if score > best_score:
-                        best_score = score
-                        best_entity = cached_entities[i]
-
-                if best_score >= SEMANTIC_THRESHOLD and best_entity:
-                    log.debug("Semantic entity match: '%s' → '%s' (%.3f)", name, best_entity, best_score)
-                    resolution_map[name] = best_entity
-                    continue
+            if self._entity_col.count() > 0 and emb:
+                results = self._entity_col.query(query_embeddings=[emb], n_results=1)
+                if results["distances"] and results["distances"][0]:
+                    cosine_dist = results["distances"][0][0]
+                    similarity = 1 - cosine_dist
+                    if similarity >= SEMANTIC_THRESHOLD:
+                        matched_name = results["metadatas"][0][0]["name"]
+                        log.debug("Semantic entity match: '%s' → '%s' (%.3f)", name, matched_name, similarity)
+                        resolution_map[name] = matched_name
+                        continue
 
             resolution_map[name] = name
 
@@ -144,7 +117,6 @@ class KnowledgeGraph:
 
     def add_entity(self, name: str, entity_type: str, aliases: list[str] | None = None,
                    canonical: str | None = None, embedding: list[float] | None = None):
-        """Add or merge an entity. If canonical is provided, skip resolution."""
         target = canonical or name
         if target in self.graph:
             existing_aliases = set(self.graph.nodes[target].get("aliases", []))
@@ -155,7 +127,11 @@ class KnowledgeGraph:
         else:
             self.graph.add_node(target, type=entity_type, aliases=aliases or [])
             if embedding:
-                self._entity_embeddings[target] = embedding
+                self._entity_col.add(
+                    ids=[str(uuid.uuid4())],
+                    embeddings=[embedding],
+                    metadatas=[{"name": target, "type": entity_type}],
+                )
 
     def add_relationship(self, source: str, target: str, relation: str):
         if source in self.graph and target in self.graph:
@@ -171,11 +147,20 @@ class KnowledgeGraph:
         claim["ingested_at"] = datetime.now(timezone.utc).isoformat()
         if canonical_entity:
             claim["entity"] = canonical_entity
+        claim_id = str(uuid.uuid4())
+        claim["id"] = claim_id
         self._claims.append(claim)
+
         if embedding:
-            self._claim_embeddings.append(embedding)
-        else:
-            self._claim_embeddings.append([])
+            self._claim_col.add(
+                ids=[claim_id],
+                embeddings=[embedding],
+                metadatas=[{
+                    "entity": claim.get("entity", ""),
+                    "source_doc": claim.get("source_doc", ""),
+                    "claim_text": claim.get("claim", "")[:500],
+                }],
+            )
         return claim
 
     def add_contradiction(self, existing_claim: dict, new_claim: dict, relation_type: str, explanation: str):
@@ -190,20 +175,35 @@ class KnowledgeGraph:
     def get_claims_for_entity(self, entity: str) -> list[dict]:
         return [c for c in self._claims if c["entity"] == entity]
 
-    def find_similar_claims_by_embedding(self, query_embedding: list[float], top_k: int = 10) -> list[dict]:
-        """Find top-k similar claims using cached embeddings only. Zero API calls."""
-        if not self._claims or not self._claim_embeddings:
+    def find_similar_claims(self, query_embedding: list[float], top_k: int = 10,
+                            exclude_source: str | None = None) -> list[dict]:
+        """Find top-k similar claims via ChromaDB HNSW index. O(log n), zero API calls."""
+        if self._claim_col.count() == 0:
             return []
 
-        scored = []
-        for i, cached_emb in enumerate(self._claim_embeddings):
-            if not cached_emb:
-                continue
-            score = _cosine_similarity(query_embedding, cached_emb)
-            scored.append((score, i))
+        where = {"source_doc": {"$ne": exclude_source}} if exclude_source else None
+        try:
+            results = self._claim_col.query(
+                query_embeddings=[query_embedding],
+                n_results=min(top_k, self._claim_col.count()),
+                where=where,
+                include=["metadatas", "distances"],
+            )
+        except Exception:
+            log.warning("ChromaDB query failed, falling back to empty results")
+            return []
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [self._claims[i] for _, i in scored[:top_k]]
+        matched_claims = []
+        if results["metadatas"] and results["metadatas"][0]:
+            for meta in results["metadatas"][0]:
+                claim_text = meta.get("claim_text", "")
+                entity = meta.get("entity", "")
+                for c in self._claims:
+                    if c.get("claim", "")[:500] == claim_text and c.get("entity", "") == entity:
+                        matched_claims.append(c)
+                        break
+
+        return matched_claims
 
     def get_all_entities(self) -> list[str]:
         return list(self.graph.nodes)
@@ -211,10 +211,6 @@ class KnowledgeGraph:
     @property
     def claims(self) -> list[dict]:
         return self._claims
-
-    @property
-    def claim_embeddings(self) -> list[list[float]]:
-        return self._claim_embeddings
 
     @property
     def contradictions(self) -> list[dict]:
@@ -232,7 +228,13 @@ class KnowledgeGraph:
         self.graph.clear()
         self._claims.clear()
         self._contradictions.clear()
-        self._entity_embeddings.clear()
-        self._claim_embeddings.clear()
+        self._chroma.delete_collection("entities")
+        self._chroma.delete_collection("claims")
+        self._entity_col = self._chroma.get_or_create_collection(
+            name="entities", metadata={"hnsw:space": "cosine"}
+        )
+        self._claim_col = self._chroma.get_or_create_collection(
+            name="claims", metadata={"hnsw:space": "cosine"}
+        )
         if self.path.exists():
             self.path.unlink()

@@ -4,4 +4,7 @@ __pycache__/
 .env
 results/graph.json
 results/graph_snapshots/
+results/chroma_db/
+results/ragas_scores.json
+results/eval_results.json
 .DS_Store

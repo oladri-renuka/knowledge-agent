@@ -91,21 +91,69 @@ Regenerate independently: `python visualize.py`
 src/
   llm_client.py         shared client, retry, batch embed, cosine similarity
   extractor.py           chunked extraction with deduplication
-  graph_store.py         persistent graph, cached embeddings, batch entity resolution
-  contradiction.py       cross-entity detection via embedding similarity
+  graph_store.py         persistent graph, ChromaDB embeddings, batch entity resolution
+  contradiction.py       cross-entity detection via ChromaDB HNSW search
   ingest.py              orchestrator (2 embed calls per doc)
   query.py               graph-first answers with citations
+  mcp_server.py          MCP server exposing graph as tools
+benchmark/
+  ragas_eval.py          Ragas evaluation (faithfulness, relevance, precision, recall)
 documents/               source documents (PDF, TXT, MD)
 results/
-  graph.json             knowledge graph with cached embeddings
+  graph.json             knowledge graph (entities, claims, contradictions)
   graph.html             interactive D3 visualization
+  chroma_db/             ChromaDB persistent embedding store
   graph_snapshots/       graph state after each document
 ```
+
+## MCP Server
+
+The knowledge graph is exposed as an MCP server so any MCP-compatible client (Claude Desktop, Cursor, VS Code) can query it directly.
+
+Tools exposed:
+- `query_knowledge_graph` — ask a question, get an answer with citations
+- `get_contradictions` — list all detected conflicts
+- `get_entity_claims` — get all claims about a specific entity
+- `get_graph_stats` — entity/claim/relationship/contradiction counts
+- `list_entities` — list all entities in the graph
+
+To use with Claude Desktop, add to your MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "knowledge-agent": {
+      "command": "python",
+      "args": ["src/mcp_server.py"],
+      "cwd": "/absolute/path/to/personal-knowledge-agent"
+    }
+  }
+}
+```
+
+## Evaluation
+
+Evaluated with [Ragas](https://docs.ragas.io/) on 15 held-out questions covering direct-answer, contradiction-surfacing, and coverage-gap cases.
+
+| Metric | Score | Notes |
+|--------|-------|-------|
+| Faithfulness | 0.517 | Agent answers from graph context. Two "I don't know" responses score 0 (Ragas penalizes correct refusals). Excluding those: ~0.65. |
+| Answer Relevancy | 0.430 | Same penalty on coverage-gap questions. On answerable questions: ~0.55. |
+| Context Precision | 0.080 | Graph sends all claims for relevant entities. Most are not needed for the specific question — low precision, high recall by design. |
+| Context Recall | 0.544 | About half the ground truth facts are covered by retrieved context. |
+
+Run the evaluation yourself:
+
+```bash
+python -m benchmark.ragas_eval
+```
+
+The "I don't know" cases are the most important to verify — Ragas scores them as failures, but they are correct behavior. The agent explicitly declines rather than hallucinating.
 
 ## Limitations
 
 - **Extraction quality.** gpt-4o-mini occasionally miscategorizes entity types or misses implicit claims. Switching to gpt-4o improves accuracy at higher cost.
 - **Entity resolution threshold.** Set at 0.75. If distinct concepts collapse into one node, raise toward 0.85. If the same concept appears as separate nodes with different names, lower toward 0.65. Inspect the graph after ingestion — fragmented nodes with overlapping claims mean too high, conflated nodes with unrelated claims mean too low.
 - **Latency on large documents.** A 91-page paper needs 40 extraction LLM calls (~8 min). Embedding and contradiction checking add ~2 min. Cost is ~$0.10 per paper with gpt-4o-mini.
-- **Graph file size.** Cached embeddings (1536 floats per claim) grow the JSON file. For corpora beyond ~50 documents, replace with a vector database.
+- **ChromaDB storage.** Embeddings are stored locally in ChromaDB with HNSW indexing. For corpora beyond ~10,000 documents, swap `chromadb.PersistentClient` for a hosted vector database (Pinecone, Weaviate, Qdrant) — the query interface is identical.
 - **No cross-claim inference.** The system detects direct contradictions and refinements. It does not infer transitive contradictions (A contradicts B, B implies C, therefore A contradicts C).

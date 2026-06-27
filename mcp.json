@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "knowledge-agent": {
+      "command": "python",
+      "args": ["src/mcp_server.py"],
+      "cwd": "."
+    }
+  }
+}

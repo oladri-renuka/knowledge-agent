@@ -1,13 +1,11 @@
-"""Cross-entity contradiction detection via cached semantic similarity.
+"""Cross-entity contradiction detection via ChromaDB similarity search.
 
-Embeds new claims in one batch call, compares against cached claim embeddings
-using pure math (zero API calls for similarity), then sends top-k similar pairs
-to LLM for contradiction classification.
+Embeds new claims in one batch call, queries ChromaDB for top-k similar existing
+claims (O(log n) via HNSW index), then sends pairs to LLM for classification.
 """
 
 import logging
 from src.llm_client import chat_json, embed
-from src.graph_store import _cosine_similarity
 
 log = logging.getLogger(__name__)
 
@@ -58,18 +56,17 @@ Return an EMPTY results array if there are no contradictions or refinements."""
 
 
 def check_contradictions(new_claims: list[dict], graph) -> tuple[list[dict], list[list[float]]]:
-    """Check new claims against existing claims using semantic similarity.
+    """Check new claims against ChromaDB-indexed existing claims.
 
-    Embedding cost: exactly 1 API call (batch embed all new claims).
-    Similarity search: zero API calls (pure math against cached embeddings).
-    LLM calls: ~N/5 where N = new claims with similar existing claims.
+    Embedding cost: 1 API call (batch embed new claims).
+    Similarity search: 0 API calls (ChromaDB HNSW, O(log n)).
+    LLM calls: ~N/5 for contradiction classification.
 
     Returns (conflicts, new_claim_embeddings).
     """
     if not new_claims:
         return [], []
 
-    # One batch embedding call for all new claims
     new_texts = [c["claim"] for c in new_claims]
     try:
         new_embeddings = embed(new_texts)
@@ -77,32 +74,24 @@ def check_contradictions(new_claims: list[dict], graph) -> tuple[list[dict], lis
         log.exception("Failed to embed new claims — skipping contradiction check")
         return [], []
 
-    if not graph.claims or not graph.claim_embeddings:
-        log.info("No existing claims with embeddings — skipping contradiction check")
+    if not graph.claims:
         return [], new_embeddings
 
-    # Bulk similarity: new embeddings × cached embeddings (pure math, zero API calls)
-    existing_claims = graph.claims
-    existing_embeddings = graph.claim_embeddings
-
+    # Query ChromaDB for similar claims — O(log n) per query, zero API calls
     claim_groups: dict[int, list[dict]] = {}
-    for i, nc_emb in enumerate(new_embeddings):
-        scored = []
-        for j, ex_emb in enumerate(existing_embeddings):
-            if not ex_emb:
-                continue
-            score = _cosine_similarity(nc_emb, ex_emb)
-            scored.append((score, j))
+    source_doc = new_claims[0].get("source_doc", "")
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top_k = [existing_claims[j] for _, j in scored[:MAX_SIMILAR_CLAIMS]]
-        if top_k:
-            claim_groups[i] = top_k
+    for i, nc_emb in enumerate(new_embeddings):
+        similar = graph.find_similar_claims(
+            nc_emb, top_k=MAX_SIMILAR_CLAIMS, exclude_source=source_doc
+        )
+        if similar:
+            claim_groups[i] = similar
 
     if not claim_groups:
         return [], new_embeddings
 
-    # Batch LLM calls for contradiction classification
+    # Batch LLM calls
     conflicts = []
     total_calls = 0
     group_indices = sorted(claim_groups.keys())
@@ -114,7 +103,7 @@ def check_contradictions(new_claims: list[dict], graph) -> tuple[list[dict], lis
         all_existing = {}
         for idx in batch_indices:
             for ec in claim_groups[idx]:
-                key = (ec.get("entity", ""), ec["claim"])
+                key = (ec.get("entity", ""), ec.get("claim", ""))
                 if key not in all_existing:
                     all_existing[key] = ec
         existing_list = list(all_existing.values())

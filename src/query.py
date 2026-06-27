@@ -91,9 +91,36 @@ def query(question: str, graph) -> str:
 
     log.info("Query '%s' — %d relevant entities, %d relevant claims", question[:60], len(relevant_entities), len(relevant_claims))
 
-    return chat_text(
+    answer = chat_text(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\n=== QUESTION ===\n{question}"}
         ]
     )
+    return answer
+
+
+def query_with_contexts(question: str, graph) -> tuple[str, list[str]]:
+    """Answer a question and return the retrieved claim texts used as context."""
+    all_claims = graph.claims
+    contradictions = graph.contradictions
+
+    relevant_entities = _find_relevant_entities(question, graph)
+    relevant_entity_set = set(relevant_entities)
+
+    relevant_claims = [c for c in all_claims if c["entity"] in relevant_entity_set]
+    if not relevant_claims:
+        relevant_claims = all_claims
+
+    contexts = [f"[{c.get('source_doc', '?')}] {c['entity']}: {c['claim']}" for c in relevant_claims]
+
+    for con in contradictions:
+        if (con["existing_claim"].get("entity") in relevant_entity_set
+                or con["new_claim"].get("entity") in relevant_entity_set):
+            contexts.append(
+                f"CONFLICT: [{con['existing_claim'].get('source_doc', '?')}] \"{con['existing_claim']['claim']}\" "
+                f"vs [{con['new_claim'].get('source_doc', '?')}] \"{con['new_claim']['claim']}\""
+            )
+
+    answer = query(question, graph)
+    return answer, contexts
